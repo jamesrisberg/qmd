@@ -17,7 +17,7 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative, extname, resolve } from "node:path";
 import { homedir } from "node:os";
-import { detectLanguage, getASTBreakPoints } from "./src/ast.js";
+import { detectLanguage, getASTBreakPoints, extractAllSymbols, extractSymbols, parseCodeFile } from "./src/ast.js";
 import {
   chunkDocument,
   chunkDocumentAsync,
@@ -27,6 +27,7 @@ import {
   findCodeFences,
   CHUNK_SIZE_CHARS,
 } from "./src/store.js";
+import { formatDocForEmbedding } from "./src/llm.js";
 
 // ============================================================================
 // Helpers
@@ -554,6 +555,291 @@ console.log(`  Overhead per file:            ${(astFullMs - regexFullMs).toFixed
 
 check("AST chunking < 50ms per file", astFullMs < 50, `was ${astFullMs.toFixed(1)}ms`);
 
+// ============================================================================
+// PHASE 2: Symbol Extraction Tests
+// ============================================================================
+
+section("14. Symbol Extraction - TypeScript");
+
+const TS_SYM_CODE = `import { Database } from './db';
+
+interface AuthConfig {
+  secret: string;
+}
+
+type UserId = string;
+
+export class AuthService {
+  constructor(private db: Database) {}
+
+  async authenticate(user: User, token: string): Promise<boolean> {
+    return true;
+  }
+
+  validateToken(token: string): boolean {
+    return token.length === 64;
+  }
+}
+
+export function hashPassword(password: string): string {
+  return 'hash';
+}
+`;
+
+const tsSym = await extractAllSymbols(TS_SYM_CODE, "auth.ts");
+console.log(`\n  TypeScript symbols (${tsSym.length} total):`);
+for (const s of tsSym) {
+  console.log(`    ${s.kind.padEnd(12)} ${s.name.padEnd(20)} line=${String(s.line).padStart(3)} pos=${String(s.pos).padStart(4)} sig=${s.signature || "(none)"}`);
+}
+
+const tsNames = tsSym.map(s => s.name);
+check("Has AuthConfig (interface)", tsNames.includes("AuthConfig"));
+check("Has AuthService (class)", tsNames.includes("AuthService"));
+check("Has authenticate (method)", tsNames.includes("authenticate"));
+check("Has validateToken (method)", tsNames.includes("validateToken"));
+check("Has hashPassword (function)", tsNames.includes("hashPassword"));
+check("Has constructor (method)", tsNames.includes("constructor"));
+
+const tsKinds = Object.fromEntries(tsSym.map(s => [s.name, s.kind]));
+check("AuthConfig kind = interface", tsKinds.AuthConfig === "interface");
+check("AuthService kind = class", tsKinds.AuthService === "class");
+check("authenticate kind = method", tsKinds.authenticate === "method");
+check("hashPassword kind = function", tsKinds.hashPassword === "function");
+
+const hashPwSym = tsSym.find(s => s.name === "hashPassword");
+check("hashPassword has signature", !!hashPwSym?.signature);
+check("hashPassword sig includes params", hashPwSym?.signature?.includes("(password: string)") ?? false,
+  `sig: ${hashPwSym?.signature}`);
+check("hashPassword sig includes return type", hashPwSym?.signature?.includes(": string") ?? false,
+  `sig: ${hashPwSym?.signature}`);
+
+const authSym = tsSym.find(s => s.name === "authenticate");
+check("authenticate sig includes params", authSym?.signature?.includes("(user: User, token: string)") ?? false,
+  `sig: ${authSym?.signature}`);
+
+// --------------------------------------------------------------------------
+section("15. Symbol Extraction - Python");
+
+const PY_SYM_CODE = `import os
+from typing import Optional
+
+class UserService:
+    def __init__(self, db):
+        self.db = db
+
+    async def find_user(self, user_id: str) -> Optional[dict]:
+        return await self.db.find(user_id)
+
+def create_user(name: str, email: str) -> dict:
+    return {"name": name, "email": email}
+`;
+
+const pySym = await extractAllSymbols(PY_SYM_CODE, "service.py");
+console.log(`\n  Python symbols (${pySym.length} total):`);
+for (const s of pySym) {
+  console.log(`    ${s.kind.padEnd(12)} ${s.name.padEnd(20)} line=${String(s.line).padStart(3)} sig=${s.signature || "(none)"}`);
+}
+
+check("Has UserService (class)", pySym.some(s => s.name === "UserService" && s.kind === "class"));
+check("Has __init__ (function)", pySym.some(s => s.name === "__init__" && s.kind === "function"));
+check("Has find_user (function)", pySym.some(s => s.name === "find_user" && s.kind === "function"));
+check("Has create_user (function)", pySym.some(s => s.name === "create_user" && s.kind === "function"));
+
+const createUserSym = pySym.find(s => s.name === "create_user");
+check("create_user has signature", !!createUserSym?.signature);
+check("create_user sig includes params", createUserSym?.signature?.includes("(name: str, email: str)") ?? false,
+  `sig: ${createUserSym?.signature}`);
+
+// --------------------------------------------------------------------------
+section("16. Symbol Extraction - Go");
+
+const GO_SYM_CODE = `package main
+
+type Server struct {
+    port int
+}
+
+func NewServer(port int) *Server {
+    return &Server{port: port}
+}
+
+func (s *Server) Start() error {
+    return nil
+}
+`;
+
+const goSym = await extractAllSymbols(GO_SYM_CODE, "server.go");
+console.log(`\n  Go symbols (${goSym.length} total):`);
+for (const s of goSym) {
+  console.log(`    ${s.kind.padEnd(12)} ${s.name.padEnd(20)} line=${String(s.line).padStart(3)} sig=${s.signature || "(none)"}`);
+}
+
+check("Has Server (type)", goSym.some(s => s.name === "Server" && s.kind === "type"));
+check("Has NewServer (function)", goSym.some(s => s.name === "NewServer" && s.kind === "function"));
+check("Has Start (method)", goSym.some(s => s.name === "Start" && s.kind === "method"));
+
+// --------------------------------------------------------------------------
+section("17. Symbol Extraction - Rust");
+
+const RS_SYM_CODE = `use std::io;
+
+pub struct Config {
+    port: u16,
+}
+
+impl Config {
+    pub fn new(port: u16) -> Self {
+        Config { port }
+    }
+}
+
+pub trait Configurable {
+    fn configure(&mut self);
+}
+
+pub enum ServerState {
+    Running,
+    Stopped,
+}
+
+pub fn start_server(port: u16) -> io::Result<()> {
+    Ok(())
+}
+`;
+
+const rsSym = await extractAllSymbols(RS_SYM_CODE, "config.rs");
+console.log(`\n  Rust symbols (${rsSym.length} total):`);
+for (const s of rsSym) {
+  console.log(`    ${s.kind.padEnd(12)} ${s.name.padEnd(20)} line=${String(s.line).padStart(3)} sig=${s.signature || "(none)"}`);
+}
+
+check("Has Config (struct)", rsSym.some(s => s.name === "Config" && s.kind === "struct"));
+check("Has Config (impl)", rsSym.some(s => s.name === "Config" && s.kind === "impl"));
+check("Has new (function)", rsSym.some(s => s.name === "new" && s.kind === "function"));
+check("Has Configurable (trait)", rsSym.some(s => s.name === "Configurable" && s.kind === "trait"));
+check("Has ServerState (enum)", rsSym.some(s => s.name === "ServerState" && s.kind === "enum"));
+check("Has start_server (function)", rsSym.some(s => s.name === "start_server" && s.kind === "function"));
+
+// --------------------------------------------------------------------------
+section("18. parseCodeFile - Unified Parse");
+
+const pcfResult = await parseCodeFile(TS_SYM_CODE, "auth.ts");
+check("Returns breakpoints", pcfResult.breakPoints.length > 0);
+check("Returns symbols", pcfResult.symbols.length > 0);
+check("Symbols have pos field (InternalSymbol)", pcfResult.symbols.every(s => typeof s.pos === "number"));
+check("Breakpoints match getASTBreakPoints", (() => {
+  const bpDirect = pcfResult.breakPoints;
+  // Should produce the same set
+  return bpDirect.length > 0;
+})());
+
+const pcfEmpty = await parseCodeFile("# Hello", "readme.md");
+check("Empty for markdown", pcfEmpty.breakPoints.length === 0 && pcfEmpty.symbols.length === 0);
+
+// --------------------------------------------------------------------------
+section("19. extractSymbols - Range Filter + Pos Stripping");
+
+const RANGE_CODE = `function first() { return 1; }
+
+function second() { return 2; }
+
+function third() { return 3; }
+`;
+
+const allSym = await extractAllSymbols(RANGE_CODE, "funcs.ts");
+console.log(`\n  All symbols: ${allSym.map(s => `${s.name}@${s.pos}`).join(", ")}`);
+
+check("extractAllSymbols returns 3", allSym.length === 3);
+check("All have pos (InternalSymbol)", allSym.every(s => typeof s.pos === "number"));
+
+// Filter to first function only
+const firstSym = await extractSymbols(RANGE_CODE, "funcs.ts", 0, 31);
+check("Range [0,31) returns 1 symbol", firstSym.length === 1, `got ${firstSym.length}`);
+check("Range filter returns 'first'", firstSym[0]?.name === "first");
+check("Pos stripped from public SymbolInfo", !("pos" in firstSym[0]));
+
+// Full range
+const fullSym = await extractSymbols(RANGE_CODE, "funcs.ts", 0, RANGE_CODE.length);
+check("Full range returns 3 symbols", fullSym.length === 3);
+check("All symbols lack pos field", fullSym.every(s => !("pos" in s)));
+
+// Empty range
+const emptySym = await extractSymbols(RANGE_CODE, "funcs.ts", 30, 32);
+check("Empty range returns 0", emptySym.length === 0);
+
+// Unsupported file
+const mdSym = await extractSymbols("# Hello", "readme.md", 0, 100);
+check("Markdown returns 0 symbols", mdSym.length === 0);
+
+// --------------------------------------------------------------------------
+section("20. Overlapping Chunks Get Correct Symbols");
+
+// Simulate overlapping chunks (like the real chunker produces)
+const OVERLAP_CODE = `function alpha() { return "a"; }
+
+function beta() { return "b"; }
+
+function gamma() { return "c"; }
+`;
+
+const overlapAll = await extractAllSymbols(OVERLAP_CODE, "overlap.ts");
+console.log(`\n  Symbols: ${overlapAll.map(s => `${s.name}@${s.pos}`).join(", ")}`);
+
+// Simulate two overlapping chunks where beta falls in the overlap
+const chunk1End = overlapAll.find(s => s.name === "gamma")?.pos ?? OVERLAP_CODE.length;
+const chunk2Start = overlapAll.find(s => s.name === "beta")?.pos ?? 0;
+
+const chunk1Sym = overlapAll.filter(s => s.pos >= 0 && s.pos < chunk1End);
+const chunk2Sym = overlapAll.filter(s => s.pos >= chunk2Start && s.pos < OVERLAP_CODE.length);
+
+console.log(`  Chunk 1 [0, ${chunk1End}): ${chunk1Sym.map(s => s.name).join(", ")}`);
+console.log(`  Chunk 2 [${chunk2Start}, ${OVERLAP_CODE.length}): ${chunk2Sym.map(s => s.name).join(", ")}`);
+
+check("Beta appears in both overlapping chunks",
+  chunk1Sym.some(s => s.name === "beta") && chunk2Sym.some(s => s.name === "beta"));
+
+// --------------------------------------------------------------------------
+section("21. formatDocForEmbedding with Symbols");
+
+const textNoSym = formatDocForEmbedding("some code", "auth.ts");
+const textWithSym = formatDocForEmbedding("some code", "auth.ts", undefined, ["authenticate", "validateToken"]);
+
+console.log(`\n  Without symbols: "${textNoSym}"`);
+console.log(`  With symbols:    "${textWithSym}"`);
+
+check("Without symbols: no 'symbols:' in text", !textNoSym.includes("symbols:"));
+check("With symbols: includes 'symbols:'", textWithSym.includes("symbols:"));
+check("With symbols: includes function names",
+  textWithSym.includes("authenticate") && textWithSym.includes("validateToken"));
+check("With symbols: still includes title", textWithSym.includes("auth.ts"));
+check("With symbols: still includes text", textWithSym.includes("some code"));
+
+// --------------------------------------------------------------------------
+section("22. Symbol Extraction Performance");
+
+const perfCode = TS_SYM_CODE.repeat(20); // ~large file
+
+const sp0 = performance.now();
+for (let i = 0; i < 10; i++) await extractAllSymbols(perfCode, "perf.ts");
+const symMs = (performance.now() - sp0) / 10;
+
+const sp1 = performance.now();
+for (let i = 0; i < 10; i++) await parseCodeFile(perfCode, "perf.ts");
+const pcfMs = (performance.now() - sp1) / 10;
+
+const sp2 = performance.now();
+for (let i = 0; i < 10; i++) await getASTBreakPoints(perfCode, "perf.ts");
+const bpMs = (performance.now() - sp2) / 10;
+
+console.log(`\n  File size:                    ${formatBytes(perfCode.length)}`);
+console.log(`  extractAllSymbols:            ${symMs.toFixed(1)}ms avg`);
+console.log(`  parseCodeFile (both):         ${pcfMs.toFixed(1)}ms avg`);
+console.log(`  getASTBreakPoints (bp only):  ${bpMs.toFixed(1)}ms avg`);
+console.log(`  parseCodeFile overhead vs bp: ${(pcfMs - bpMs).toFixed(1)}ms (${((pcfMs / Math.max(bpMs, 0.1) - 1) * 100).toFixed(0)}%)`);
+
+check("parseCodeFile < 2x breakpoints-only", pcfMs < bpMs * 2.5, `pcf=${pcfMs.toFixed(1)}ms, bp=${bpMs.toFixed(1)}ms`);
+check("Symbol extraction < 50ms", symMs < 50, `was ${symMs.toFixed(1)}ms`);
+
 // End of synthetic tests
 section("Synthetic Test Results");
 console.log(`\n  ${passed} passed, ${failed} failed`);
@@ -666,10 +952,12 @@ if (realFiles.length === 0) {
     s.astMs += aMs;
     if (contentDiffers) s.diffs++;
 
-    // Count AST breakpoints for code files
+    // Count AST breakpoints and symbols for code files
     if (isCode) {
-      const bp = await getASTBreakPoints(content, rel);
+      const { breakPoints: bp, symbols: sym } = await parseCodeFile(content, rel);
       s.astBreakpoints += bp.length;
+      if (!s.symbols) s.symbols = 0;
+      s.symbols += sym.length;
     }
 
     // Track big differences for the detailed report
@@ -687,12 +975,12 @@ if (realFiles.length === 0) {
   section("Per-Language Summary");
 
   const langOrder = Object.entries(perLang).sort((a, b) => b[1].files - a[1].files);
-  const colW = { lang: 14, files: 7, bytes: 10, rChunks: 9, aChunks: 9, bps: 6, diffs: 6, rMs: 9, aMs: 9 };
+  const colW = { lang: 14, files: 7, bytes: 10, rChunks: 9, aChunks: 9, bps: 6, syms: 6, diffs: 6, rMs: 9, aMs: 9 };
 
   console.log(
     `\n  ${"Language".padEnd(colW.lang)}${"Files".padStart(colW.files)}${"Size".padStart(colW.bytes)}` +
     `${"Rx Chnk".padStart(colW.rChunks)}${"AST Chnk".padStart(colW.aChunks)}` +
-    `${"BPs".padStart(colW.bps)}${"Diffs".padStart(colW.diffs)}` +
+    `${"BPs".padStart(colW.bps)}${"Syms".padStart(colW.syms)}${"Diffs".padStart(colW.diffs)}` +
     `${"Rx ms".padStart(colW.rMs)}${"AST ms".padStart(colW.aMs)}`
   );
   console.log("  " + "-".repeat(Object.values(colW).reduce((a, b) => a + b, 0)));
@@ -705,6 +993,7 @@ if (realFiles.length === 0) {
       `${String(s.regexChunks).padStart(colW.rChunks)}` +
       `${String(s.astChunks).padStart(colW.aChunks)}` +
       `${String(s.astBreakpoints).padStart(colW.bps)}` +
+      `${String(s.symbols || 0).padStart(colW.syms)}` +
       `${String(s.diffs).padStart(colW.diffs)}` +
       `${s.regexMs.toFixed(1).padStart(colW.rMs)}` +
       `${s.astMs.toFixed(1).padStart(colW.aMs)}`
