@@ -15,8 +15,11 @@ git clone https://github.com/jamesrisberg/qmd.git
 cd qmd
 git checkout dev
 bun install
+bun run build
 bun link
 ```
+
+The `bun run build` step compiles TypeScript to `dist/` — without it the `qmd` binary will fail with a missing module error.
 
 Verify: `qmd status` should run without errors.
 
@@ -24,7 +27,8 @@ Verify: `qmd status` should run without errors.
 
 ```sh
 # Add your repo as a collection (run from your project dir)
-qmd collection add . --name my-project
+# The default glob is **/*.md — use --mask to include code files
+qmd collection add . --name my-project --mask '**/*.{ts,tsx,js,kt,swift,md}'
 
 # Add context so search understands what's in here
 qmd context add qmd://my-project/ "Brief description of your project"
@@ -32,6 +36,8 @@ qmd context add qmd://my-project/ "Brief description of your project"
 # Generate embeddings with AST-aware chunking for code files
 qmd embed --chunk-strategy auto
 ```
+
+**Note on `--mask`:** Without it, only Markdown files are indexed. Adjust the extension list to match your stack (e.g. add `py`, `go`, `rs`, etc.).
 
 The `--chunk-strategy auto` flag is what enables AST-aware chunking — it uses tree-sitter to split code files at function/class boundaries instead of arbitrary line counts. Without it you get basic regex chunking.
 
